@@ -262,7 +262,7 @@ class MainActivity:ComponentActivity(){
                                     item{Row(verticalAlignment=Alignment.CenterVertically){Checkbox(checked=liveTranslation,onCheckedChange={liveTranslation=it});Text(tr("ترجمة المقاطع فور تفريغها","Translate finalized chunks automatically"),style=MaterialTheme.typography.bodySmall)}}
                                     item{Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){
                                         Button(enabled=hasConsent,modifier=Modifier.weight(1f),onClick={
-                                            val start={
+                                            val start: () -> Unit = {
                                                 lifecycleScope.launch{
                                                     val id=UUID.randomUUID().toString()
                                                     dao.upsert(SessionEntity(id=id,title=title.ifBlank{tr("تسجيل جديد","New recording")},kind=kind,status="recording",language=language,
