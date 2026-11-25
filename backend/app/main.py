@@ -6,6 +6,7 @@ import re
 import sqlite3
 import uuid
 from typing import Literal
+import math
 
 import httpx
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
@@ -14,7 +15,9 @@ from pydantic import BaseModel, Field
 
 from .core import OpenAIProvider, UnconfiguredProvider, config, connection, file_kind, make_token, require_token
 
-app = FastAPI(title="NoteFlow AI Gateway", version="1.0.0", docs_url="/docs")
+app = FastAPI(title="NoteFlow AI Gateway", version="1.2.0", docs_url="/docs")
+
+SUPPORTED_LANGUAGES = {"ar": "Arabic", "en": "English", "fr": "French", "es": "Spanish", "de": "German", "tr": "Turkish", "it": "Italian", "pt": "Portuguese", "hi": "Hindi", "ur": "Urdu", "zh": "Chinese (Simplified)", "ja": "Japanese", "ko": "Korean", "ru": "Russian"}
 _store_lock = asyncio.Lock()
 
 
@@ -32,7 +35,7 @@ class PairRequest(BaseModel):
 
 class TranslateRequest(BaseModel):
     text: str = Field(min_length=1, max_length=20000)
-    target: Literal["ar", "en"]
+    target: Literal["ar", "en", "fr", "es", "de", "tr", "it", "pt", "hi", "ur", "zh", "ja", "ko", "ru"]
     segment_id: str
     revision: int = Field(ge=0, default=0)
 
@@ -43,14 +46,33 @@ class Segment(BaseModel):
 
 
 class GenerateRequest(BaseModel):
-    kind: Literal["summary", "flashcards", "actions"]
+    kind: Literal["summary", "flashcards", "actions", "quiz"]
     style: str = Field(default="brief", max_length=40)
     segments: list[Segment] = Field(min_length=1, max_length=200)
 
 
+class SearchRequest(BaseModel):
+    query: str = Field(min_length=2, max_length=2000)
+    segments: list[Segment] = Field(min_length=1, max_length=200)
+    top_k: int = Field(default=5, ge=1, le=20)
+
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    if len(a) != len(b) or not a: raise ValueError("Embedding dimensions mismatch")
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x*x for x in a)); norm_b = math.sqrt(sum(x*x for x in b))
+    return dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
+
+
+@app.get("/v1/languages")
+async def languages():
+    return {"languages": SUPPORTED_LANGUAGES, "diarization_configured": bool(config("NOTEFLOW_DIARIZATION_MODEL")),
+            "note": "Diarization availability depends on model support; deprecated OpenAI option ends 2027-02-26."}
+
+
 @app.get("/v1/health")
 async def health():
-    return {"status": "ok", "provider_configured": bool(config("OPENAI_API_KEY")), "pairing_configured": bool(config("NOTEFLOW_PAIRING_SECRET") and config("NOTEFLOW_SIGNING_KEY")), "version": "1.0.0"}
+    return {"status": "ok", "provider_configured": bool(config("OPENAI_API_KEY")), "pairing_configured": bool(config("NOTEFLOW_PAIRING_SECRET") and config("NOTEFLOW_SIGNING_KEY")), "version": "1.2.0"}
 
 
 @app.post("/v1/auth/token")
@@ -175,6 +197,15 @@ async def generate(req: GenerateRequest, provider=Depends(get_provider)):
                 "owner": owner, "due_date": due,
                 "decision_state": state if state in ("decision", "proposal") else "proposal",
                 "status": "draft", "source_ids": ids})
+        elif req.kind == "quiz":
+            options = item.get("options")
+            correct = item.get("correct_index")
+            if not isinstance(options, list) or len(options) != 4 or not all(isinstance(x, str) and x.strip() and len(x) <= 500 for x in options): continue
+            if not isinstance(correct, int) or isinstance(correct, bool) or not 0 <= correct < 4: continue
+            question = str(item.get("question", ""))
+            if not question.strip() or len(question) > 500: continue
+            items.append({"id": str(uuid.uuid4()), "question": question, "options": options,
+                          "correct_index": correct, "status": "draft", "source_ids": ids})
         elif req.kind == "flashcards":
             items.append({"id": str(uuid.uuid4()), "question": str(item.get("question", "")),
                           "answer": str(item.get("answer", "")), "status": "draft", "source_ids": ids})
@@ -189,3 +220,49 @@ async def delete_session(session_id: str):
     except ValueError: raise HTTPException(422, "Invalid session")
     with connection() as db: db.execute("DELETE FROM transcriptions WHERE session_id=?", (session_id,))
     return {"status": "deleted", "stored_audio": False}
+
+
+@app.post("/v1/semantic-search", dependencies=[Depends(authenticate)])
+async def semantic_search(req: SearchRequest, provider=Depends(get_provider)):
+    """Stateless semantic retrieval: embeddings are not persisted on the gateway."""
+    texts = [req.query] + [s.text[:20000] for s in req.segments]
+    try:
+        vectors = await provider.embed(texts)
+        if len(vectors) != len(texts): raise ValueError("Provider returned unexpected embedding count")
+        scores = []
+        for source, vector in zip(req.segments, vectors[1:]):
+            score = cosine_similarity(vectors[0], vector)
+            scores.append({"segment_id": source.id, "score": round(float(score), 6), "text": source.text})
+        scores.sort(key=lambda item: item["score"], reverse=True)
+        return {"matches": scores[:req.top_k], "kind": "semantic", "model": config("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")}
+    except UnconfiguredProvider as e: raise HTTPException(503, str(e))
+    except (ValueError, httpx.HTTPError, TypeError, OverflowError): raise HTTPException(502, "Embedding provider unavailable or returned invalid vectors")
+
+
+@app.post("/v1/diarize", dependencies=[Depends(authenticate)])
+async def diarize(session_id: str = Form(...), segment_index: int = Form(...),
+    audio: UploadFile = File(...), provider=Depends(get_provider)):
+    """Speaker labels are relative to an uploaded chunk, NOT identities across chunks."""
+    valid_session(session_id, segment_index)
+    data, filename = await read_audio(audio)
+    try:
+        diarized = await provider.diarize(data, filename)
+    except UnconfiguredProvider as e: raise HTTPException(503, str(e))
+    except (httpx.HTTPError, ValueError, KeyError, TypeError): raise HTTPException(502, "Diarization failed")
+    turns = []
+    for row in diarized.get("segments", []):
+        if not isinstance(row, dict): continue
+        try:
+            start=float(row["start"]); end=float(row["end"])
+            if not all(math.isfinite(t) for t in (start,end)) or start<0 or end<=start or end>24*3600: continue
+            speaker=str(row.get("speaker", "unknown"))[:60]
+            turns.append({"id": str(uuid.uuid5(uuid.NAMESPACE_URL, f'{session_id}/{segment_index}/{len(turns)}/{start}')),
+                          "speaker": speaker, "start_ms": round(start*1000), "end_ms": round(end*1000),
+                          "text": str(row.get("text", ""))[:20000]})
+        except (ValueError, TypeError, KeyError): continue
+    return {"session_id": session_id, "segment_index": segment_index, "turns": turns,
+            "speaker_scope": "audio_segment", "stable_identity_across_segments": False}
+
+# Modular enterprise functionality: independent credential scope & tenant isolation.
+from .enterprise import router as enterprise_router
+app.include_router(enterprise_router)

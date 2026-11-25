@@ -28,7 +28,7 @@ class TranscriptionWorker(context:Context,params:WorkerParameters):CoroutineWork
             }
             dao.saveTranscript(segmentId,"done",text)
             if(session.liveTranslation){
-                val target=if(session.language=="en")"ar" else "en"
+                val target=session.translationTarget
                 val latest=dao.segment(segmentId) ?: segment
                 val translated=gateway.translate(segmentId,latest.revision,latest.effectiveText(),target)
                 dao.saveTranslation(segmentId,translated,target,latest.revision)

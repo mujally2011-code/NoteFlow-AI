@@ -16,6 +16,8 @@ import kotlinx.coroutines.launch
 import org.noteflow.app.data.AppDatabase
 import org.noteflow.app.data.AudioSegmentEntity
 import org.noteflow.app.network.TranscriptionWorker
+import org.noteflow.app.offline.ModelInstaller
+import org.noteflow.app.offline.OfflineTranscriptionWorker
 import java.io.File
 
 /** Record 15-second independently finalized M4A chunks, protecting completed chunks on crash. */
@@ -96,7 +98,12 @@ class RecordingService:Service(){
                 val db=AppDatabase.get(applicationContext).notes()
                 db.upsertSegment(item)
                 db.updateCapture(session,if(rotating)"recording" else "paused",System.currentTimeMillis(),file.absolutePath,elapsed,null)
-                TranscriptionWorker.queue(applicationContext,item.id)
+                val config=db.get(session)
+                if(config != null && config.processingMode != "cloud" && ModelInstaller.installed(applicationContext)) {
+                    OfflineTranscriptionWorker.queue(applicationContext,item.id)
+                } else if(config != null && config.cloudConsent && config.processingMode != "local") {
+                    TranscriptionWorker.queue(applicationContext,item.id)
+                }
             }
         }
     }

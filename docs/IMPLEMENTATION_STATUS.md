@@ -1,3 +1,18 @@
+# NoteFlow AI phase-2 source candidate – verification on 2026-11-18
+
+**Not a validated APK release.** Tested FastAPI application with fake provider: `9 passed`. Tested standalone pure Kotlin logic with `kotlinc`: PASS. Static privacy/HTTPS guardrails: PASS. Android Gradle tests / Android lint / Android APK / device/emulator QA: FAILED TO START (actual `./gradlew testDebugUnitTest lintDebug assembleDebug` attempt stopped at bootstrap with `java.net.UnknownHostException: services.gradle.org`; Android SDK also unavailable). Live AI and real speaker/embedding accuracy: NOT TESTED (no server-side API key supplied). Connected GitHub account has no accessible repositories; no push or GitHub Actions run occurred.
+
+Features added since v1.0 source candidate:
+- Multilingual target selector and backend validation (14 languages).
+- Speaker diarization route and per-chunk Room speaker-turn storage; optional model adapter.
+- Four-answer quiz generation with source evidence, saved local answer feedback and retry.
+- Server-side vector similarity search plus offline device-local lexical search fallback.
+- Room migration 3 → 4, new tests and updated GitHub Actions artifact names.
+
+For precise code paths, configuration and limitations read `PHASE2_IMPLEMENTATION_AR.md`. The remaining v1.0 caveats below are preserved for traceability.
+
+---
+
 # NoteFlow AI v1.0.0 · verification report (2026-11-18)
 
 **Status: SOURCE CANDIDATE — NOT A VALIDATED APK RELEASE.**

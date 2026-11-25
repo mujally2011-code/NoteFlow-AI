@@ -128,7 +128,13 @@ class OpenAIProvider:
         return json.loads(value)
 
     async def translate(self, text: str, target: str) -> str:
-        result = await self._text_json(f"Translate faithfully into {'Arabic' if target=='ar' else 'English'}. Preserve acronyms, names and numbers. JSON shape: {{\"translation\":\"...\"}}.", {"text": text})
+        # Validate at the HTTP boundary. Resolve a name here to prevent code
+        # injection through user-supplied language labels.
+        names = {"ar":"Arabic","en":"English","fr":"French","es":"Spanish","de":"German",
+                 "tr":"Turkish","it":"Italian","pt":"Portuguese","hi":"Hindi","ur":"Urdu",
+                 "zh":"Simplified Chinese","ja":"Japanese","ko":"Korean","ru":"Russian"}
+        language = names[target]
+        result = await self._text_json(f"Translate faithfully into {language}. Preserve acronyms, names and numbers. JSON shape: {{\"translation\":\"...\"}}.", {"text": text})
         return str(result["translation"])
 
     async def generate(self, kind: str, segments: list[dict], style: str) -> list[dict]:
@@ -136,5 +142,29 @@ class OpenAIProvider:
             "summary": "Summarize accurately; JSON shape {\"items\":[{\"text\":\"...\",\"source_ids\":[\"id\"]}]}. Each item must cite matching source IDs. Do not invent facts.",
             "flashcards": "Create questions and answers; JSON shape {\"items\":[{\"question\":\"...\",\"answer\":\"...\",\"source_ids\":[\"id\"]}]}. Every card must cite sources.",
             "actions": "Extract meeting tasks. Distinguish decisions from proposals. JSON shape {\"items\":[{\"text\":\"...\",\"owner\":null,\"due_date\":null,\"decision_state\":\"proposal\",\"source_ids\":[\"id\"]}]}. Leave owner and due_date null unless explicitly stated. decision_state is decision or proposal. Cite evidence.",
+            "quiz": "Write multiple-choice study questions grounded in sources. Return valid JSON {\"items\":[{\"question\":\"...\",\"options\":[\"A\",\"B\",\"C\",\"D\"],\"correct_index\":0,\"source_ids\":[\"id\"]}]}. All options are distinct, exactly one correct, cite evidence. Do not invent facts.",
         }
         return (await self._text_json(instructions[kind], {"style": style, "segments": segments}))["items"]
+
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        model = config("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+        async with httpx.AsyncClient(timeout=120) as client:
+            response = await client.post(f"{self.base}/embeddings", headers=self._headers(),
+                json={"model": model, "input": texts})
+            response.raise_for_status()
+            rows = sorted(response.json()["data"], key=lambda obj: obj["index"])
+            return [item["embedding"] for item in rows]
+
+    async def diarize(self, audio: bytes, filename: str) -> dict:
+        model = config("NOTEFLOW_DIARIZATION_MODEL")
+        if not model:
+            raise UnconfiguredProvider("Diarization provider is not configured. Set NOTEFLOW_DIARIZATION_MODEL.")
+        # OpenAI's gpt-4o-transcribe-diarize is deprecated, with shutdown
+        # announced for 2027-02-26. This optional adapter must be replaced.
+        async with httpx.AsyncClient(timeout=180) as client:
+            response = await client.post(f"{self.base}/audio/transcriptions", headers=self._headers(),
+                files={"file": (filename, audio)}, data={"model": model,
+                    "response_format": "diarized_json", "chunking_strategy": "auto"})
+            response.raise_for_status()
+            return response.json()

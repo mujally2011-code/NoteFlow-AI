@@ -1,0 +1,113 @@
+name: NoteFlow Phase 3 Android Release, tests and source
+on:
+  workflow_dispatch:
+  push:
+    branches: [release/phase3-v1.2.0]
+permissions:
+  contents: read
+jobs:
+  verify-build-package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+      - name: Install official Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Backend and integration tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -r backend/requirements-dev.txt
+          (cd backend && PYTHONPATH=. pytest -q)
+      - name: Android unit tests and lint
+        run: gradle --no-daemon testDebugUnitTest lintDebug
+      - name: Build unsigned release binary
+        run: gradle --no-daemon assembleRelease
+      - name: Sign installable Release APK; encrypt signing-key recovery
+        shell: bash
+        env:
+          RELEASE_KEYSTORE_B64: ${{ secrets.NF_RELEASE_KEYSTORE_B64 }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.NF_RELEASE_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p out
+          TMP=$(mktemp -d)
+          trap 'rm -rf "$TMP"' EXIT
+          export NF_PASS=''
+          if [[ -n "$RELEASE_KEYSTORE_B64" && -n "$RELEASE_KEYSTORE_PASSWORD" ]]; then
+            printf '%s' "$RELEASE_KEYSTORE_B64" | base64 -d > "$TMP/noteflow.jks"
+            NF_PASS="$RELEASE_KEYSTORE_PASSWORD"
+            echo 'SIGNING=Configured persistent release keystore' > out/BUILD_INFO.txt
+          elif [[ -z "$RELEASE_KEYSTORE_B64" && -z "$RELEASE_KEYSTORE_PASSWORD" ]]; then
+            NF_PASS=$(openssl rand -hex 32)
+            echo "::add-mask::$NF_PASS"
+            keytool -genkeypair -noprompt -alias noteflow-release -keyalg RSA -keysize 3072 \
+              -validity 9000 -keystore "$TMP/noteflow.jks" \
+              -storepass "$NF_PASS" -keypass "$NF_PASS" \
+              -dname 'CN=NoteFlow AI, O=NoteFlow Open Source, C=YE'
+            printf '%s' "$NF_PASS" > "$TMP/password.txt"
+            (cd "$TMP" && tar -czf signing-backup.tar.gz noteflow.jks password.txt)
+            openssl cms -encrypt -binary -aes256 -in "$TMP/signing-backup.tar.gz" \
+              -recip .github/release-recovery.crt -outform DER \
+              -out out/NoteFlow-AI-RELEASE-KEY-ENCRYPTED.p7m
+            echo 'SIGNING=New production-format release key; encrypted key escrow artifact supplied' > out/BUILD_INFO.txt
+          else
+            echo 'Both NF_RELEASE_KEYSTORE_B64 and NF_RELEASE_KEYSTORE_PASSWORD must be set together' >&2
+            exit 1
+          fi
+          export NF_PASS
+          unsigned=app/build/outputs/apk/release/app-release-unsigned.apk
+          test -s "$unsigned"
+          "$ANDROID_HOME/build-tools/35.0.0/zipalign" -f -p 4 "$unsigned" "$TMP/aligned.apk"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign \
+            --ks "$TMP/noteflow.jks" --ks-key-alias noteflow-release \
+            --ks-pass env:NF_PASS --key-pass env:NF_PASS \
+            --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true \
+            --out out/NoteFlow-AI-v1.2.0-release.apk "$TMP/aligned.apk"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs \
+            out/NoteFlow-AI-v1.2.0-release.apk > out/APK_SIGNATURE.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging out/NoteFlow-AI-v1.2.0-release.apk \
+            | head -15 > out/APK_PACKAGE.txt
+          printf 'COMMIT=%s\n' "$(git rev-parse HEAD)" >> out/BUILD_INFO.txt
+          printf 'BUILD=release (non-debug)\n' >> out/BUILD_INFO.txt
+          printf 'DEVICE_SMOKE_TEST=NOT RUN (no emulator attached)\n' >> out/BUILD_INFO.txt
+      - name: Archive matching open-source source with official Gradle wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon wrapper --gradle-version 8.11.1
+          TMP=$(mktemp -d)
+          trap 'rm -rf "$TMP"' EXIT
+          mkdir -p "$TMP/source"
+          git archive HEAD | tar -xf - -C "$TMP/source"
+          install -m 0644 gradle/wrapper/gradle-wrapper.jar \
+             "$TMP/source/gradle/wrapper/gradle-wrapper.jar"
+          (cd "$TMP/source" && zip -qr "$GITHUB_WORKSPACE/out/NoteFlow-AI-v1.2.0-open-source.zip" .)
+          sha256sum out/NoteFlow-AI-v1.2.0-release.apk \
+            out/NoteFlow-AI-v1.2.0-open-source.zip > out/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: NoteFlow-Phase3-RELEASE-${{ github.sha }}
+          path: out/*
+          retention-days: 90
+          if-no-files-found: error

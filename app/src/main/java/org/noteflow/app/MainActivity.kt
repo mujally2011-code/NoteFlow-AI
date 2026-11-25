@@ -40,10 +40,14 @@ import org.json.JSONObject
 import org.noteflow.app.audio.RecordingService
 import org.noteflow.app.data.*
 import org.noteflow.app.domain.scheduleNextReview
+import org.noteflow.app.domain.lexicalSearch
+import org.noteflow.app.domain.quizIsCorrect
 import org.noteflow.app.export.Exports
 import org.noteflow.app.network.BackendGateway
 import org.noteflow.app.network.BackendSettings
 import org.noteflow.app.network.TranscriptionWorker
+import org.noteflow.app.offline.ModelInstaller
+import org.noteflow.app.offline.OfflineTranscriptionWorker
 import java.io.File
 import java.text.DateFormat
 import java.util.Date
@@ -64,6 +68,7 @@ class MainActivity:ComponentActivity(){
     private fun play(segment:AudioSegmentEntity,onError:(String)->Unit){
         try{
             player?.release()
+            require(segment.path.isNotBlank() && File(segment.path).isFile){"This transcript has no linked audio recording"}
             player=MediaPlayer().apply{setDataSource(segment.path);prepare();start()}
         }catch(e:Exception){onError(e.message?:"Playback failed")}
     }
@@ -74,7 +79,8 @@ class MainActivity:ComponentActivity(){
             val root=File(filesDir,"recordings").canonicalFile
             if(folder.parentFile==root)folder.deleteRecursively()
             dao.deleteSegments(session.id);dao.deleteSummaries(session.id);dao.deleteCards(session.id)
-            dao.deleteActions(session.id);dao.deleteBookmarks(session.id);dao.delete(session.id)
+            dao.deleteActions(session.id);dao.deleteBookmarks(session.id)
+            dao.deleteQuizzes(session.id);dao.deleteSpeakers(session.id);dao.delete(session.id)
             if(session.cloudConsent){
                 val deleted=if(BackendSettings.configured(applicationContext))
                     try{BackendGateway(applicationContext).deleteSession(session.id)}catch(_:Exception){false}
@@ -119,9 +125,36 @@ class MainActivity:ComponentActivity(){
                 val now=System.currentTimeMillis()
                 dao.upsert(SessionEntity(id=id,title="Imported ${DateFormat.getDateTimeInstance().format(Date(now))}",kind=kind,status="ready",createdAt=now,updatedAt=now,audioPath=dest!!.absolutePath,durationMs=durationMs,language=language,processingMode=BackendSettings.mode(applicationContext)))
                 dao.upsertSegment(AudioSegmentEntity("$id:0",id,0,0,durationMs,dest!!.absolutePath))
+                if(ModelInstaller.installed(applicationContext) && BackendSettings.mode(applicationContext)!="cloud") {
+                    OfflineTranscriptionWorker.queue(applicationContext,"$id:0")
+                }
                 // Cloud processing requires opt-in separately, even for imports.
                 withContext(Dispatchers.Main){onResult("Imported locally. Enable cloud consent in session to transcribe.")}
             }catch(e:Exception){dest?.parentFile?.deleteRecursively();withContext(Dispatchers.Main){onResult(e.message?:"Import failed")}}
+        }
+    }
+
+    private fun importTranscript(uri:Uri,kind:String,onResult:(String)->Unit){
+        lifecycleScope.launch(Dispatchers.IO){
+            try{
+                val data=contentResolver.openInputStream(uri)?.use{stream->
+                    val output=java.io.ByteArrayOutputStream()
+                    val buffer=ByteArray(32768)
+                    while(true){val count=stream.read(buffer);if(count<0)break
+                        require(output.size()+count<=3*1024*1024){"Transcript too large (3 MB maximum)"}
+                        output.write(buffer,0,count)
+                    }
+                    output.toString("UTF-8")
+                } ?: error("Cannot read selected transcript")
+                val content=data.removePrefix("\uFEFF").trim()
+                require(content.isNotEmpty() && !content.contains('\u0000')){"Choose a UTF-8 TXT transcript"}
+                val id=UUID.randomUUID().toString()
+                val now=System.currentTimeMillis()
+                dao.upsert(SessionEntity(id=id,title="Imported transcript ${DateFormat.getDateInstance().format(Date(now))}",
+                    kind=kind,status="ready",createdAt=now,updatedAt=now,processingMode="local"))
+                dao.upsertSegment(AudioSegmentEntity(id+":0",id,0,0,0,"",status="done",originalText=content))
+                withContext(Dispatchers.Main){onResult("Transcript imported locally without audio")}
+            }catch(e:Exception){withContext(Dispatchers.Main){onResult(e.message?:"Transcript import failed")}}
         }
     }
 
@@ -129,7 +162,7 @@ class MainActivity:ComponentActivity(){
         if(session.processingMode=="local" || !session.cloudConsent){inform("Cloud consent is required for this feature");return}
         lifecycleScope.launch(Dispatchers.IO){
             try{
-                val target=if(session.language=="en")"ar" else "en"
+                val target=session.translationTarget
                 val result=BackendGateway(applicationContext).translate(segment.id,segment.revision,segment.effectiveText(),target)
                 dao.saveTranslation(segment.id,result,target,segment.revision)
                 withContext(Dispatchers.Main){inform("Translation saved")}
@@ -154,10 +187,64 @@ class MainActivity:ComponentActivity(){
                         "summary"->dao.upsertSummary(SummaryEntity(item.getString("id"),session.id,style,item.getString("text"),sources,revision))
                         "flashcards"->dao.upsertCard(FlashcardEntity(item.getString("id"),session.id,item.getString("question"),item.getString("answer"),sources))
                         "actions"->dao.upsertAction(ActionEntity(item.getString("id"),session.id,item.getString("text"),item.optString("owner").takeIf{it.isNotBlank()},item.optString("due_date").takeIf{it.isNotBlank()},item.optString("decision_state","proposal"),sources))
+                        "quiz"->dao.upsertQuiz(QuizQuestionEntity(item.getString("id"),session.id,item.getString("question"),item.getJSONArray("options").toString(),item.getInt("correct_index"),sources))
                     }
                 }
                 withContext(Dispatchers.Main){inform("Generated ${items.length()} items")}
             }catch(e:Exception){withContext(Dispatchers.Main){inform(e.message?:"Generation failed")}}
+        }
+    }
+
+    private fun labelSpeakers(session:SessionEntity,chunks:List<AudioSegmentEntity>,inform:(String)->Unit){
+        if(session.processingMode=="local" || !session.cloudConsent){inform("Enable cloud processing for speaker labeling");return}
+        lifecycleScope.launch(Dispatchers.IO){
+            try{
+                require(chunks.isNotEmpty()){"No audio chunks"}
+                val gateway=BackendGateway(applicationContext)
+                var count=0
+                for(chunk in chunks){
+                    val rows=gateway.diarizeChunk(session.id,chunk.segmentIndex,File(chunk.path))
+                    for(i in 0 until rows.length()){
+                        val r=rows.getJSONObject(i)
+                        // Keep speaker IDs scoped to their originating chunk.
+                        dao.upsertSpeakerTurn(SpeakerTurnEntity(r.getString("id"),session.id,chunk.id,
+                            "#${chunk.segmentIndex+1} · ${r.getString("speaker")}",
+                            chunk.startMs+r.getLong("start_ms"),chunk.startMs+r.getLong("end_ms"),r.optString("text")))
+                        count++
+                    }
+                }
+                withContext(Dispatchers.Main){inform("Saved $count speaker turns (chunk-scoped labels)")}
+            }catch(e:Exception){withContext(Dispatchers.Main){inform(e.message?:"Speaker labeling failed")}}
+        }
+    }
+
+    private fun searchSegments(session:SessionEntity,chunks:List<AudioSegmentEntity>,query:String,
+        onResults:(List<Pair<String,String>>,String)->Unit,inform:(String)->Unit){
+        if(query.isBlank()){inform("Enter a search query");return}
+        val data=chunks.filter{it.effectiveText().isNotBlank()}.map{it.id to it.effectiveText()}
+        if(data.isEmpty()){inform("No transcript text yet");return}
+        if(!session.cloudConsent || session.processingMode=="local" || !BackendSettings.configured(applicationContext)){
+            val local=lexicalSearch(query,data).take(20).map{it.segmentId to it.text}
+            onResults(local,"lexical (offline)")
+            return
+        }
+        lifecycleScope.launch(Dispatchers.IO){
+            try{
+                val gateway=BackendGateway(applicationContext)
+                val ranked=data.chunked(200).flatMap{batch->
+                    val rows=gateway.semanticSearch(query,batch,topK=10)
+                    (0 until rows.length()).map{val item=rows.getJSONObject(it)
+                        Triple(item.getString("segment_id"),item.getString("text"),item.getDouble("score"))}
+                }
+                val matches=ranked.sortedByDescending{it.third}.take(20).map{it.first to it.second}
+                withContext(Dispatchers.Main){onResults(matches,"semantic (cloud)")}
+            }catch(e:Exception){
+                val fallback=lexicalSearch(query,data).take(20).map{it.segmentId to it.text}
+                withContext(Dispatchers.Main){
+                    onResults(fallback,"lexical fallback (offline)")
+                    inform("Cloud semantic search unavailable: ${e.message}")
+                }
+            }
         }
     }
 
@@ -183,6 +270,12 @@ class MainActivity:ComponentActivity(){
         var editAnswer by remember{mutableStateOf("")}
         var editOwner by remember{mutableStateOf("")}
         var editDue by remember{mutableStateOf("")}
+        var targetLanguage by remember{mutableStateOf("en")}
+        var semanticQuery by remember{mutableStateOf("")}
+        var expectedModelSha by remember{mutableStateOf("")}
+        var installedModel by remember{mutableStateOf(ModelInstaller.installed(applicationContext))}
+        var matchMode by remember{mutableStateOf("")}
+        var semanticMatches by remember{mutableStateOf(emptyList<Pair<String,String>>())}
         var exportFormat by remember{mutableStateOf("txt")}
         var exportId by remember{mutableStateOf("")}
         val selected=sessionOrNull(sessions,selectedId)
@@ -194,6 +287,10 @@ class MainActivity:ComponentActivity(){
         val cards by cardsFlow.collectAsState(initial=emptyList())
         val actionsFlow=remember(selectedId){dao.actions(selectedId)}
         val actions by actionsFlow.collectAsState(initial=emptyList())
+        val speakersFlow=remember(selectedId){dao.speakers(selectedId)}
+        val speakerTurns by speakersFlow.collectAsState(initial=emptyList())
+        val quizzesFlow=remember(selectedId){dao.quizzes(selectedId)}
+        val quizzes by quizzesFlow.collectAsState(initial=emptyList())
         val bookmarksFlow=remember(selectedId){dao.bookmarks(selectedId)}
         val bookmarks by bookmarksFlow.collectAsState(initial=emptyList())
         val matchingFlow=remember(query){dao.searchMatchingSessionIds(query)}
@@ -218,6 +315,18 @@ class MainActivity:ComponentActivity(){
         }
         val picker=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){uri->
             if(uri!=null)importAudio(uri,kind,language){message=it}
+        }
+        val textPicker=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){uri->
+            if(uri!=null)importTranscript(uri,kind){message=it}
+        }
+        val modelPicker=rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()){ uri ->
+            if(uri!=null)lifecycleScope.launch(Dispatchers.IO){
+                try{
+                    val stream=contentResolver.openInputStream(uri) ?: error("Cannot open speech model archive")
+                    ModelInstaller.install(applicationContext,stream,expectedModelSha)
+                    withContext(Dispatchers.Main){installedModel=true;message=tr("تم تثبيت النموذج المحلي بنجاح","Offline speech model installed")}
+                }catch(e:Exception){withContext(Dispatchers.Main){message=e.message?:"Model installation failed"}}
+            }
         }
         val exporter=rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/octet-stream")){uri->
             if(uri!=null){val session=sessions.firstOrNull{it.id==exportId};if(session!=null)lifecycleScope.launch(Dispatchers.IO){
@@ -257,6 +366,10 @@ class MainActivity:ComponentActivity(){
                                     item{Row(modifier=Modifier.horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(6.dp)){
                                         listOf("auto" to tr("تلقائي","Auto"),"ar" to "عربي","en" to "English").forEach{(v,label)->FilterChip(selected=language==v,onClick={language=v},label={Text(label)})}
                                     }}
+                                    item{Text(tr("لغة الترجمة المطلوبة","Translation target language"),style=MaterialTheme.typography.labelMedium)}
+                                    item{Row(modifier=Modifier.horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(4.dp)){
+                                        phase2Languages.forEach{(code,label)->FilterChip(selected=targetLanguage==code,onClick={targetLanguage=code},label={Text(label)})}
+                                    }}
                                     item{Row(verticalAlignment=Alignment.CenterVertically){Checkbox(checked=hasConsent,onCheckedChange={hasConsent=it});Text(tr("أؤكد إبلاغ المشاركين والحصول على الموافقة اللازمة","I confirm appropriate recording consent"),style=MaterialTheme.typography.bodySmall)}}
                                     item{Row(verticalAlignment=Alignment.CenterVertically){Checkbox(checked=cloudConsent,onCheckedChange={cloudConsent=it});Text(tr("أسمح بإرسال الصوت والنص إلى الخادم لهذه الجلسة","Allow cloud processing for this session"),style=MaterialTheme.typography.bodySmall)}}
                                     item{Row(verticalAlignment=Alignment.CenterVertically){Checkbox(checked=liveTranslation,onCheckedChange={liveTranslation=it});Text(tr("ترجمة المقاطع فور تفريغها","Translate finalized chunks automatically"),style=MaterialTheme.typography.bodySmall)}}
@@ -266,7 +379,7 @@ class MainActivity:ComponentActivity(){
                                                 lifecycleScope.launch{
                                                     val id=UUID.randomUUID().toString()
                                                     dao.upsert(SessionEntity(id=id,title=title.ifBlank{tr("تسجيل جديد","New recording")},kind=kind,status="recording",language=language,
-                                                        processingMode=mode,cloudConsent=cloudConsent && mode!="local",liveTranslation=liveTranslation))
+                                                        processingMode=mode,cloudConsent=cloudConsent && mode!="local",liveTranslation=liveTranslation,translationTarget=targetLanguage))
                                                     try{ContextCompat.startForegroundService(this@MainActivity,Intent(this@MainActivity,RecordingService::class.java).setAction(RecordingService.ACTION_START).putExtra(RecordingService.EXTRA_SESSION,id))}
                                                     catch(e:Exception){dao.updateCapture(id,"error",System.currentTimeMillis(),null,0,e.message)}
                                                 }
@@ -277,6 +390,9 @@ class MainActivity:ComponentActivity(){
                                         OutlinedButton(modifier=Modifier.weight(1f),onClick={picker.launch(arrayOf("audio/*","application/octet-stream"))}){Text(tr("استيراد ملف","Import audio"))}
                                     }}
                                 }
+                                item{OutlinedButton(onClick={textPicker.launch(arrayOf("text/plain","application/octet-stream"))}){
+                                    Text(tr("استيراد نص Teams / Zoom محفوظ بصيغة TXT","Import Teams / Zoom transcript (TXT)"))
+                                }}
                                 item{Text(tr("المكتبة المحلية","Local library"),style=MaterialTheme.typography.titleMedium)}
                                 item{OutlinedTextField(query,onValueChange={query=it},label={Text(tr("بحث في العناوين والنصوص","Search titles and transcripts"))},modifier=Modifier.fillMaxWidth(),singleLine=true)}
                                 item{Row(horizontalArrangement=Arrangement.spacedBy(6.dp)){
@@ -297,7 +413,12 @@ class MainActivity:ComponentActivity(){
                                 item{Column(verticalArrangement=Arrangement.spacedBy(4.dp)){
                                     listOf("local" to tr("محلي فقط — لا إرسال لأي بيانات","Local only — no upload"),"cloud" to tr("سحابي عند الطلب (بموافقة كل جلسة)","Cloud when approved per session"),"auto" to tr("تلقائي — محلي عند توفر المحرك، وإلا بعد موافقة صريحة","Auto — local when available; cloud only with consent")).forEach{(value,label)->Row(verticalAlignment=Alignment.CenterVertically){RadioButton(selected=mode==value,onClick={mode=value});Text(label,style=MaterialTheme.typography.bodySmall)}}
                                 }}
-                                item{Text(tr("تُحفظ ملفات التسجيل محلياً. لم يُضمّن محرك تفريغ محلي في هذا البناء.","Local audio is stored on device. This build does not bundle an offline ASR model."),style=MaterialTheme.typography.bodySmall)}
+                                item{Text(if(installedModel) tr("نموذج التفريغ المحلي مثبت. تتم معالجة مقاطع الصوت دون إنترنت.","Offline ASR model installed; audio chunks are processed on-device.") else tr("للتفريغ المحلي المتقدم استورد نموذج Vosk موثوقاً مع بصمته SHA-256. لا تُرفع بيانات التسجيل.","For advanced offline ASR, import a trusted Vosk model with its SHA-256 checksum. No recordings are uploaded."),style=MaterialTheme.typography.bodySmall)}
+                                item{OutlinedTextField(expectedModelSha,onValueChange={expectedModelSha=it.trim()},label={Text("Vosk model ZIP SHA-256")},modifier=Modifier.fillMaxWidth(),singleLine=true)}
+                                item{OutlinedButton(onClick={modelPicker.launch(arrayOf("application/zip","application/octet-stream"))},enabled=expectedModelSha.length==64){Text(tr("استيراد نموذج صوتي محلي","Install offline ASR model"))}}
+                                item{if(server.startsWith("https://"))OutlinedButton(onClick={
+                                    startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(server.trimEnd('/')+"/v1/enterprise/panel")))
+                                }){Text(tr("لوحة إدارة المؤسسات (متصفح)","Enterprise management portal"))}}
                                 item{OutlinedTextField(server,onValueChange={server=it},label={Text("HTTPS gateway URL")},modifier=Modifier.fillMaxWidth(),singleLine=true)}
                                 item{OutlinedTextField(secret,onValueChange={secret=it},label={Text(tr("سر الاقتران (يُخزّن مشفراً)","Pairing secret (encrypted at rest)"))},modifier=Modifier.fillMaxWidth(),singleLine=true)}
                                 item{Row(horizontalArrangement=Arrangement.spacedBy(10.dp)){
@@ -327,9 +448,17 @@ class MainActivity:ComponentActivity(){
                             }
                             "detail"->if(selected!=null){
                                 item{Row(modifier=Modifier.horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(5.dp)){
-                                    listOf("audio" to tr("الصوت","Audio"),"transcript" to tr("النص","Text"),"summary" to tr("ملخص","Summary"),"cards" to tr("بطاقات","Cards"),"tasks" to tr("مهام","Tasks"),"notes" to tr("علامات","Notes")).forEach{(v,label)->FilterChip(selected=tab==v,onClick={tab=v},label={Text(label)})}
+                                    listOf("audio" to tr("الصوت","Audio"),"transcript" to tr("النص","Text"),"summary" to tr("ملخص","Summary"),"cards" to tr("بطاقات","Cards"),"tasks" to tr("مهام","Tasks"),"quiz" to tr("اختبار","Quiz"),"speakers" to tr("المتحدثون","Speakers"),"search" to tr("بحث دلالي","Semantic"),"notes" to tr("علامات","Notes")).forEach{(v,label)->FilterChip(selected=tab==v,onClick={tab=v},label={Text(label)})}
                                 }}
                                 item{Text("${selected.kind} • ${selected.status} • ${selected.durationMs/1000}s",style=MaterialTheme.typography.labelMedium)}
+                                if(tab=="transcript"){
+                                    item{Text(tr("الترجمة إلى","Translate into"),style=MaterialTheme.typography.labelMedium)}
+                                    item{Row(modifier=Modifier.horizontalScroll(rememberScrollState()),horizontalArrangement=Arrangement.spacedBy(4.dp)){
+                                        phase2Languages.forEach{(code,label)->FilterChip(selected=selected.translationTarget==code,onClick={
+                                            lifecycleScope.launch{dao.updateTranslationTarget(selected.id,code)}
+                                        },label={Text(label)})}
+                                    }}
+                                }
                                 if(!selected.cloudConsent)item{
                                     OutlinedButton(onClick={dialog="enableCloud"}){Text(tr("تفعيل التفريغ السحابي لهذه الجلسة بعد موافقتي","Enable cloud transcription with my consent"))}
                                 }
@@ -344,7 +473,8 @@ class MainActivity:ComponentActivity(){
                                                     Text(s.path.substringAfterLast('/'),style=MaterialTheme.typography.bodySmall)
                                                 }
                                                 TextButton(onClick={play(s){message=it}}){Text("▶")}
-                                                TextButton(onClick={if(selected.cloudConsent && selected.processingMode!="local"){TranscriptionWorker.queue(applicationContext,s.id);message=tr("تمت إضافة المهمة للطابور","Queued")}else message=tr("يلزم تفعيل المعالجة السحابية لهذه الجلسة","Enable cloud consent for this session first")}){Text("ASR")}
+                                                TextButton(onClick={if(installedModel){OfflineTranscriptionWorker.queue(applicationContext,s.id);message=tr("تمت إضافة التفريغ المحلي","Offline transcription queued")}else message=tr("ثبّت نموذج Vosk من الإعدادات أولاً","Install a Vosk model in Settings")}){Text(tr("محلي","Offline"))}
+                                                TextButton(onClick={if(selected.cloudConsent && selected.processingMode!="local"){TranscriptionWorker.queue(applicationContext,s.id);message=tr("تمت إضافة المهمة للطابور","Queued")}else message=tr("يلزم تفعيل المعالجة السحابية لهذه الجلسة","Enable cloud consent for this session first")}){Text("Cloud ASR")}
                                             }
                                         }}
                                         item{Row(horizontalArrangement=Arrangement.spacedBy(8.dp)){
@@ -427,6 +557,48 @@ class MainActivity:ComponentActivity(){
                                             }
                                         }}}
                                     }
+                                    "quiz"->{
+                                        item{Button(onClick={generate("quiz","study",selected){message=it}}){Text(tr("إنشاء اختبار اختيارات","Generate a multiple-choice quiz"))}}
+                                        if(quizzes.isEmpty())item{EmptyState(tr("لم تُنشأ أسئلة بعد. تتطلب الإنشاء موافقة المعالجة السحابية.","No quiz questions yet. Generation needs cloud consent."))}
+                                        items(quizzes,key={it.id}){q->Card{Column(Modifier.padding(14.dp),verticalArrangement=Arrangement.spacedBy(8.dp)){
+                                            Text(q.question,fontWeight=FontWeight.Bold)
+                                            val options=remember(q.optionsJson){JSONArray(q.optionsJson)}
+                                            for(i in 0 until options.length()){
+                                                OutlinedButton(modifier=Modifier.fillMaxWidth(),enabled=q.chosenIndex==null,onClick={
+                                                    lifecycleScope.launch{dao.upsertQuiz(q.copy(chosenIndex=i))}
+                                                }){Text("${i+1}. ${options.getString(i)}")}
+                                            }
+                                            if(q.chosenIndex!=null){
+                                                val correct=quizIsCorrect(q.chosenIndex,q.correctIndex,options.length())
+                                                Text(if(correct)tr("✓ إجابة صحيحة","✓ Correct answer") else tr("إجابة غير صحيحة. الإجابة: ","Incorrect. Correct: ")+options.getString(q.correctIndex),
+                                                    color=if(correct)MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
+                                                TextButton(onClick={lifecycleScope.launch{dao.upsertQuiz(q.copy(chosenIndex=null))}}){Text(tr("إعادة المحاولة","Retry"))}
+                                            }
+                                            TextButton(onClick={openSource(q.sourceIdsJson,segments,::play){message=it}}){Text(tr("المصدر","Source"))}
+                                        }}}
+                                    }
+                                    "speakers"->{
+                                        item{Text(tr("الوسوم تخص المقطع الصوتي فقط، ولا تحدد هوية الشخص عبر مقاطع مختلفة.","Speaker labels apply to one audio chunk only, not a verified identity across chunks."),style=MaterialTheme.typography.bodySmall)}
+                                        item{Button(onClick={labelSpeakers(selected,segments){message=it}}){Text(tr("تمييز المتحدثين","Label speakers"))}}
+                                        if(speakerTurns.isEmpty())item{EmptyState(tr("لم تُحلل الأصوات بعد. يلزم خادم يدعم التمييز الصوتي.","No speaker turns. Configure a supported server-side diarization model."))}
+                                        items(speakerTurns,key={it.id}){turn->Card{Column(Modifier.padding(12.dp)){
+                                            Text("${turn.speaker} · ${turn.startMs/1000}s–${turn.endMs/1000}s",fontWeight=FontWeight.SemiBold)
+                                            Text(turn.text)
+                                            TextButton(onClick={segments.firstOrNull{it.id==turn.segmentId}?.let{play(it){message=it}}}){Text(tr("تشغيل المقطع","Play chunk"))}
+                                        }}}
+                                    }
+                                    "search"->{
+                                        item{OutlinedTextField(semanticQuery,onValueChange={semanticQuery=it},modifier=Modifier.fillMaxWidth(),label={Text(tr("ابحث بمعنى السؤال أو كلماته","Search by meaning or keyword"))})}
+                                        item{Button(onClick={searchSegments(selected,segments,semanticQuery,{matches,modeLabel->semanticMatches=matches;matchMode=modeLabel},{message=it})}){
+                                            Text(tr("بحث","Search"))
+                                        }}
+                                        if(matchMode.isNotBlank())item{Text(matchMode,style=MaterialTheme.typography.labelSmall)}
+                                        if(matchMode.isNotBlank() && semanticMatches.isEmpty())item{EmptyState(tr("لا توجد نتائج","No results"))}
+                                        items(semanticMatches,key={it.first}){match->Card{Column(Modifier.padding(12.dp)){
+                                            Text(match.second)
+                                            TextButton(onClick={segments.firstOrNull{it.id==match.first}?.let{play(it){message=it}}}){Text(tr("فتح المصدر","Open audio source"))}
+                                        }}}
+                                    }
                                     "notes"->{
                                         item{Button(onClick={selectedSegment="";editValue="";dialog="newBookmark"}){Text(tr("إضافة علامة وملاحظة","Add bookmark & note"))}}
                                         items(bookmarks,key={it.id}){b->Card{Row(Modifier.padding(12.dp),verticalAlignment=Alignment.CenterVertically){
@@ -480,6 +652,13 @@ class MainActivity:ComponentActivity(){
     }
 }
 
+/** Server-validated ISO 639-1 targets; UI labels are intentionally language-native. */
+private val phase2Languages=listOf(
+    "ar" to "العربية", "en" to "English", "fr" to "Français", "es" to "Español",
+    "de" to "Deutsch", "tr" to "Türkçe", "it" to "Italiano", "pt" to "Português",
+    "hi" to "हिन्दी", "ur" to "اردو", "zh" to "中文", "ja" to "日本語",
+    "ko" to "한국어", "ru" to "Русский")
+
 @Composable
 private fun ActivePanel(session:SessionEntity,segments:List<AudioSegmentEntity>,clock:Long,send:(String)->Unit,mark:()->Unit,arabic:Boolean){
     val seconds=(session.durationMs+(if(session.status=="recording")(clock-session.updatedAt).coerceAtLeast(0L) else 0L))/1000L
@@ -488,7 +667,10 @@ private fun ActivePanel(session:SessionEntity,segments:List<AudioSegmentEntity>,
             Text(if(arabic)"● جارٍ تسجيل ${session.title}" else "● Recording ${session.title}",style=MaterialTheme.typography.titleMedium)
             Text("${seconds/60} : ${(seconds%60).toString().padStart(2,'0')} | ${session.status}",style=MaterialTheme.typography.headlineMedium)
             Text(if(session.cloudConsent)"☁ ${if(arabic)"معالجة سحابية بموافقتك" else "Cloud with consent"}" else "⌂ ${if(arabic)"تسجيل محلي فقط" else "Local recording only"}")
-            segments.takeLast(3).forEach{seg->Text(if(seg.originalText.isNotBlank())seg.effectiveText() else seg.partialText.ifBlank{"#${seg.segmentIndex+1} · ${seg.status}"},style=MaterialTheme.typography.bodySmall)}
+            segments.takeLast(3).forEach{seg->
+                Text(if(seg.originalText.isNotBlank())seg.effectiveText() else seg.partialText.ifBlank{"#${seg.segmentIndex+1} · ${seg.status}"},style=MaterialTheme.typography.bodySmall)
+                if(seg.translationText!=null && seg.translatedRevision==seg.revision)Text(seg.translationText,color=MaterialTheme.colorScheme.primary,style=MaterialTheme.typography.bodySmall)
+            }
             Row(horizontalArrangement=Arrangement.spacedBy(10.dp)){
                 OutlinedButton(onClick={send(if(session.status=="paused")RecordingService.ACTION_RESUME else RecordingService.ACTION_PAUSE)}){Text(if(session.status=="paused")"▶" else "Ⅱ")}
                 Button(onClick={send(RecordingService.ACTION_STOP)}){Text(if(arabic)"إنهاء وحفظ" else "Stop & save")}

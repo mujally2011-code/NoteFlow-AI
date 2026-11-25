@@ -20,7 +20,8 @@ data class SessionEntity(
     @ColumnInfo(defaultValue="'local'") val processingMode: String = "local",
     @ColumnInfo(defaultValue="0") val cloudConsent: Boolean = false,
     @ColumnInfo(defaultValue="0") val liveTranslation: Boolean = false,
-    @ColumnInfo(defaultValue="'none'") val remoteDeleteState: String = "none"
+    @ColumnInfo(defaultValue="'none'") val remoteDeleteState: String = "none",
+    @ColumnInfo(defaultValue="'en'") val translationTarget: String = "en"
 )
 
 @Entity(tableName="audio_segments", indices=[Index(value=["sessionId","segmentIndex"],unique=true),Index("sessionId")])
@@ -63,6 +64,17 @@ data class ActionEntity(@PrimaryKey val id: String, val sessionId: String, val t
 data class BookmarkEntity(@PrimaryKey val id: String, val sessionId: String, val segmentId: String?,
     val positionMs: Long, val note: String="")
 
+/** Speaker IDs are relative to an audio segment; they are NOT recognized identities. */
+@Entity(tableName="speaker_turns", indices=[Index("sessionId"),Index("segmentId")])
+data class SpeakerTurnEntity(@PrimaryKey val id: String, val sessionId: String,
+    val segmentId: String, val speaker: String, val startMs: Long, val endMs: Long,
+    val text: String)
+
+@Entity(tableName="quiz_questions", indices=[Index("sessionId")])
+data class QuizQuestionEntity(@PrimaryKey val id: String, val sessionId: String,
+    val question: String, val optionsJson: String, val correctIndex: Int,
+    val sourceIdsJson: String, val chosenIndex: Int? = null)
+
 @Dao
 interface NoteFlowDao {
     @Query("SELECT DISTINCT sessionId FROM audio_segments WHERE originalText LIKE '%' || :query || '%' OR editedText LIKE '%' || :query || '%'") fun searchMatchingSessionIds(query:String):Flow<List<String>>
@@ -76,6 +88,8 @@ interface NoteFlowDao {
     @Query("UPDATE sessions SET remoteDeleteState=:state WHERE id=:id") suspend fun markRemoteDelete(id:String,state:String)
     @Query("UPDATE sessions SET status='interrupted',errorMessage='Previous recording interrupted. Completed chunks are safe.' WHERE status IN ('recording','paused')")
     suspend fun recoverInterrupted()
+    @Query("UPDATE sessions SET translationTarget=:target WHERE id=:id")
+    suspend fun updateTranslationTarget(id:String,target:String)
     @Query("DELETE FROM sessions WHERE id=:id") suspend fun delete(id:String)
 
     @Upsert suspend fun upsertSegment(segment:AudioSegmentEntity)
@@ -103,16 +117,24 @@ interface NoteFlowDao {
     @Query("SELECT * FROM bookmarks WHERE sessionId=:id ORDER BY positionMs") fun bookmarks(id:String):Flow<List<BookmarkEntity>>
     @Upsert suspend fun upsertBookmark(e:BookmarkEntity)
     @Query("DELETE FROM bookmarks WHERE sessionId=:id") suspend fun deleteBookmarks(id:String)
+    @Query("SELECT * FROM speaker_turns WHERE sessionId=:id ORDER BY startMs,segmentId")
+    fun speakers(id:String):Flow<List<SpeakerTurnEntity>>
+    @Upsert suspend fun upsertSpeakerTurn(item:SpeakerTurnEntity)
+    @Query("DELETE FROM speaker_turns WHERE sessionId=:id") suspend fun deleteSpeakers(id:String)
+    @Query("SELECT * FROM quiz_questions WHERE sessionId=:id ORDER BY rowid DESC")
+    fun quizzes(id:String):Flow<List<QuizQuestionEntity>>
+    @Upsert suspend fun upsertQuiz(item:QuizQuestionEntity)
+    @Query("DELETE FROM quiz_questions WHERE sessionId=:id") suspend fun deleteQuizzes(id:String)
 }
 
-@Database(entities=[SessionEntity::class,AudioSegmentEntity::class,SummaryEntity::class,FlashcardEntity::class,ActionEntity::class,BookmarkEntity::class],version=3,exportSchema=true)
+@Database(entities=[SessionEntity::class,AudioSegmentEntity::class,SummaryEntity::class,FlashcardEntity::class,ActionEntity::class,BookmarkEntity::class,SpeakerTurnEntity::class,QuizQuestionEntity::class],version=4,exportSchema=true)
 abstract class NoteFlowDatabase:RoomDatabase(){abstract fun notes():NoteFlowDao}
 
 object AppDatabase {
     @Volatile private var instance: NoteFlowDatabase?=null
     fun get(context:Context):NoteFlowDatabase = instance ?: synchronized(this){
         instance ?: Room.databaseBuilder(context.applicationContext,NoteFlowDatabase::class.java,"noteflow.db")
-            .addMigrations(MIGRATION_1_2,MIGRATION_2_3).build().also{instance=it}
+            .addMigrations(MIGRATION_1_2,MIGRATION_2_3,MIGRATION_3_4).build().also{instance=it}
     }
     private val MIGRATION_1_2 = object:androidx.room.migration.Migration(1,2){
         override fun migrate(db:SupportSQLiteDatabase){
@@ -142,4 +164,15 @@ object AppDatabase {
             db.execSQL("CREATE INDEX IF NOT EXISTS index_bookmarks_sessionId ON bookmarks(sessionId)")
         }
     }
+    private val MIGRATION_3_4=object:androidx.room.migration.Migration(3,4){
+        override fun migrate(db:SupportSQLiteDatabase){
+            db.execSQL("ALTER TABLE sessions ADD COLUMN translationTarget TEXT NOT NULL DEFAULT 'en'")
+            db.execSQL("CREATE TABLE IF NOT EXISTS speaker_turns (id TEXT NOT NULL PRIMARY KEY, sessionId TEXT NOT NULL, segmentId TEXT NOT NULL, speaker TEXT NOT NULL, startMs INTEGER NOT NULL, endMs INTEGER NOT NULL, text TEXT NOT NULL)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_speaker_turns_sessionId ON speaker_turns(sessionId)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_speaker_turns_segmentId ON speaker_turns(segmentId)")
+            db.execSQL("CREATE TABLE IF NOT EXISTS quiz_questions (id TEXT NOT NULL PRIMARY KEY, sessionId TEXT NOT NULL, question TEXT NOT NULL, optionsJson TEXT NOT NULL, correctIndex INTEGER NOT NULL, sourceIdsJson TEXT NOT NULL, chosenIndex INTEGER)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS index_quiz_questions_sessionId ON quiz_questions(sessionId)")
+        }
+    }
+
 }

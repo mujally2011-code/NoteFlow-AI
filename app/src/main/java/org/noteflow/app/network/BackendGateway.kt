@@ -10,6 +10,7 @@ import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
+import org.json.JSONArray
 import org.noteflow.app.domain.TranscriptEvent
 import org.noteflow.app.domain.TranscriptState
 import org.noteflow.app.domain.reduceTranscript
@@ -118,6 +119,28 @@ class BackendGateway(private val context:Context) {
     }
     fun translate(segmentId:String,revision:Int,text:String,target:String):String {
         return postJson("/v1/translate",JSONObject().put("segment_id",segmentId).put("revision",revision).put("text",text).put("target",target)).getString("text")
+    }
+    /** Each speaker ID refers only to the chunk supplied to this call. */
+    fun diarizeChunk(sessionId:String,index:Int,file:File):JSONArray {
+        val media=when(file.extension.lowercase()){
+            "m4a"->"audio/mp4";"mp3"->"audio/mpeg";"webm"->"audio/webm";else->"audio/wav"
+        }
+        val multipart=MultipartBody.Builder().setType(MultipartBody.FORM)
+            .addFormDataPart("session_id",sessionId)
+            .addFormDataPart("segment_index",index.toString())
+            .addFormDataPart("audio",file.name,file.asRequestBody(media.toMediaTypeOrNull()))
+            .build()
+        val req=builder("/v1/diarize").post(multipart).build()
+        client.newCall(req).execute().use{r->
+            if(!r.isSuccessful)error("Diarization HTTP ${r.code}: ${r.body?.string()?.take(160)}")
+            return JSONObject(r.body!!.string()).getJSONArray("turns")
+        }
+    }
+    fun semanticSearch(query:String,segments:List<Pair<String,String>>,topK:Int=5):JSONArray {
+        val payload=JSONObject().put("query",query).put("top_k",topK).put("segments",JSONArray().apply {
+            segments.forEach{(id,text)->put(JSONObject().put("id",id).put("text",text))}
+        })
+        return postJson("/v1/semantic-search",payload).getJSONArray("matches")
     }
     fun deleteSession(id:String):Boolean{
         val r=builder("/v1/sessions/$id").delete().build()

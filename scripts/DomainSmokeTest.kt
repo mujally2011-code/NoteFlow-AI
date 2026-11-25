@@ -14,5 +14,8 @@ fun main() {
     val b=scheduleNextReview(a.intervalDays,a.ease,1,1000L)
     check(a.intervalDays==3 && b.intervalDays>a.intervalDays)
     check(scheduleNextReview(12,2.5,0,1000L).intervalDays==1)
-    println("PASS: transcript dedupe/out-of-order/final + spaced repetition (JVM)")
+    val matches=lexicalSearch("Database Index",listOf("a" to "محاضرة Database Index", "b" to "اجتماع المالية"))
+    check(matches.size==1 && matches[0].segmentId=="a")
+    check(quizIsCorrect(2,2,4) && !quizIsCorrect(2,1,4))
+    println("PASS: transcript ordering, review scheduler, offline search, quiz grading (JVM)")
 }

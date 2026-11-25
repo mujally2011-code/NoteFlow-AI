@@ -99,3 +99,77 @@ def test_audio_validation(client):
         data={"session_id": str(uuid.uuid4()), "segment_index": 0},
         files={"audio": ("virus.mp3", b"not an MP3", "audio/mpeg")})
     assert r.status_code == 415
+
+# Phase-2 contract tests. These deliberately use a fake provider; they do not
+# claim an external model has been exercised.
+async def _embed(texts):
+    table = {
+        "database index": [1.0, 0.0, 0.0],
+        "الفهرس يساعد الاستعلامات": [0.98, 0.2, 0.0],
+        "المطار بعيد": [0.0, 1.0, 0.0],
+    }
+    return [table.get(text, [0.1, 0.1, 1.0]) for text in texts]
+
+async def _diarize(data, filename):
+    return {"segments": [
+        {"speaker": "speaker_0", "start": 0.0, "end": 2.4, "text": "السلام عليكم"},
+        {"speaker": "speaker_1", "start": 2.5, "end": 4.0, "text": "أهلاً"},
+        {"speaker": "speaker_2", "start": -3.0, "end": 1.0, "text": "invalid"},
+    ]}
+
+async def _quiz_generate(self, kind, segments, style):
+    if kind == "quiz":
+        return [{"question": "ما دور الفهرس؟", "options": ["التسريع", "الحذف", "التشفير", "الترجمة"],
+                 "correct_index": 0, "source_ids": [segments[0]["id"]]},
+                {"question": "Invalid answer", "options": ["Only one"], "correct_index": 9,
+                 "source_ids": [segments[0]["id"]]}]
+    return await FakeProvider._legacy_generate(self, kind, segments, style)
+
+FakeProvider.embed = staticmethod(_embed)
+FakeProvider.diarize = staticmethod(_diarize)
+FakeProvider._legacy_generate = FakeProvider.generate
+FakeProvider.generate = _quiz_generate
+
+
+def test_languages_and_multilingual_translation(client):
+    assert "fr" in client.get("/v1/languages").json()["languages"]
+    hdr = auth(client)
+    ok = client.post("/v1/translate", headers=hdr, json={
+        "segment_id": "s", "text": "مرحبا", "revision": 1, "target": "fr"})
+    assert ok.status_code == 200
+    assert ok.json()["target"] == "fr"
+    assert client.post("/v1/translate", headers=hdr, json={
+        "segment_id": "s", "text": "hello", "target": "invalid"}).status_code == 422
+
+
+def test_semantic_ranking_and_source_provenance(client):
+    result = client.post("/v1/semantic-search", headers=auth(client), json={
+        "query": "database index", "top_k": 2, "segments": [
+            {"id": "s-a", "text": "المطار بعيد"},
+            {"id": "s-b", "text": "الفهرس يساعد الاستعلامات"}]})
+    assert result.status_code == 200, result.text
+    rows = result.json()["matches"]
+    assert len(rows) == 2 and rows[0]["segment_id"] == "s-b"
+    assert rows[0]["score"] >= rows[1]["score"]
+
+
+def test_diarization_returns_chunk_scoped_speakers(client):
+    result = client.post("/v1/diarize", headers=auth(client),
+        data={"session_id": str(uuid.uuid4()), "segment_index": 0},
+        files={"audio": ("chunk.wav", fake_wav(), "audio/wav")})
+    assert result.status_code == 200, result.text
+    body = result.json()
+    assert body["stable_identity_across_segments"] is False
+    assert len(body["turns"]) == 2
+    assert body["turns"][1]["start_ms"] == 2500
+    assert len({t["id"] for t in body["turns"]}) == 2
+
+
+def test_multiple_choice_quiz_validates_answer_and_evidence(client):
+    result = client.post("/v1/generate", headers=auth(client), json={
+        "kind": "quiz", "segments": [{"id": "x", "text": "الفهرس يسرع الاستعلام"}]})
+    assert result.status_code == 200, result.text
+    cards = result.json()["items"]
+    assert len(cards) == 1
+    assert cards[0]["correct_index"] == 0
+    assert cards[0]["source_ids"] == ["x"]
